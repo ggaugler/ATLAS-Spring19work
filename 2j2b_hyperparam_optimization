@@ -1,0 +1,378 @@
+"""
+Written by Geoffrey Gaugler // ggaugler@cern.ch
+
+Optimizing hyperparameters for the neural network used for the 2j2b analysis region with Bayesian optimization using Gaussian Processes via the Scikit-Optimize library. 
+This is part of a study with the ATLAS experiment at the LHC in Meyrin, Switzerland using neural networks to separate single top tW events from top anti-top ttbar events. 
+There are two other analysis regions (1j1b and 2j1b) each with their own neural network.
+This particular run of hyperparameter optimization is done using my first of three methods for dealing with the class imbalance present in this problem, 
+which I denote with 'method1'. This method scales the sum of tW event weights so that they're equal to the sum of ttbar event weights.
+
+The findings of this study are to be published as an internal ATLAS document, which I will link here once that happens.
+"""
+
+import numpy as np
+import pandas as pd
+from numpy.random import seed
+seed(1) # Using the same seed for the sake of consistency and reproducibility
+from tensorflow import set_random_seed
+set_random_seed(2) # Using the same seed for the sake of consistency and reproducibility
+import math
+import tensorflow as tf
+from tensorflow.python.keras.callbacks import TensorBoard
+import keras
+from keras import backend as K
+from keras.callbacks import Callback
+from keras import models, layers, Input, regularizers, losses, metrics, optimizers
+from keras.models import Sequential, Model, load_model
+from sklearn.metrics import roc_auc_score
+import skopt
+from skopt import gp_minimize, forest_minimize
+from skopt.space import Real, Categorical, Integer
+from skopt.plots import plot_convergence, plot_objective, plot_evaluations
+from skopt.utils import use_named_args
+import twaml.data
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+tW2j2b = twaml.data.from_pytables('/home/geoff/data/tW_DR_r2j2b.h5')
+ttbar2j2b = twaml.data.from_pytables('/home/geoff/data/ttbar_r2j2b.h5')#imports ttbar and tW datasets
+
+# Default weights are around 1e-03, want to work with weights around 1
+ttbar2j2b.weights *= 1000 
+tW2j2b.weights *= 1000
+
+# Scaling the sum of tW event weights so that they're equal to the sum of ttbar event weights 
+tW2j2b.weights *= sum(ttbar2j2b.weights) / sum(tW2j2b.weights) 
+
+
+# Creating a pandas dataframe from tW data so that it's easier to work with
+tWdf = tW2j2b.df 
+# Assigning the value of one as the label for all tW events
+tWdf['tW'] = 1 
+tWdf['Weight'] = tW2j2b.weights
+
+# Doing the same for the ttbar dataset
+ttdf = ttbar2j2b.df
+ttdf['tW'] = 0
+ttdf['Weight'] = ttbar2j2b.weights
+
+# Combining the ttbar and tW datasets
+sumdf = pd.concat([tWdf, ttdf], sort=True)
+
+# Splitting the data into a training set and a test set, and subsequently splitting the training set into a training set and validation set
+train, test = train_test_split(sumdf, 
+                               test_size = .1, 
+                               random_state = 72, 
+                               shuffle=True) 
+
+train, val = train_test_split(train, test_size = .1,
+                              random_state = 72,
+                              shuffle=True)
+
+# Selecting only the kinematic characteristics of interest/desired features for the 2j2b analysis region. 
+# These were determined by a procedure similar to principle component analysis (PCA)
+features = ['mass_lep1jet2',
+            'pTsys_lep1lep2met',
+            'mass_lep1jet1',
+            'mass_lep2jet1',
+            'deltaR_lep1_jet1',
+            'pT_jet2',
+            'mass_lep2jet2']
+
+# Selecting the features, labels and weights for the training, validation and test sets
+x_train = train[features] 
+y_train = train['tW']
+train_weights = train['Weight']
+
+x_val = val[features]                 
+y_val = val['tW']
+val_weights = val['Weight']
+
+x_test = test[features]
+y_test = test['tW']
+test_weights = test['Weight']
+
+
+# Scaling the training data so that each feature has a mean of 0 and a standard deviation of 1
+scaler = StandardScaler()
+x_train = scaler.fit_transform(x_train)
+
+# Scaling the validation and test data features by the same scaler used to standardize the training data
+x_val = scaler.transform(x_val)
+x_test = scaler.transform(x_test) 
+
+# Converting data to Numpy arrays that aren't already so that they can fed into the neural network
+y_train = y_train.to_numpy()
+train_weights = train_weights.to_numpy()
+y_val = y_val.to_numpy()
+val_weights = val_weights.to_numpy()
+y_test = y_test.to_numpy()
+test_weights = test_weights.to_numpy()
+
+    
+def log_dir_name(learning_rate,
+                 num_dense_nodes1,
+                 num_dense_nodes2,
+                 dropout):
+    
+    """
+    Creating the dir-name for the TensorBoard log-dir as well as for saving the performance of the model in a .txt file. 
+    Each name contains information about the hyperparameters of the model.
+    
+    Takes the hyperparameters we want to optimize as arguments:
+    learning_rate:     Learning-rate for the optimizer.
+    num_dense_nodes:   Number of nodes in the first dense layer.
+    num_dense_nodes2:  Number of nodes in the second dense layer.
+    dropout:           The percentage of nodes in the first dense layer to be randomly dropped to 0.
+    """
+
+    s = "./2j2bbdt_batch512_method1_logs/lr_{0}_nodes_{1},{2}_dropout_{3}_relu,relu_batchsize512_method1/"
+
+    log_dir = s.format(learning_rate,
+                       num_dense_nodes1,
+                       num_dense_nodes2,
+                       dropout)
+
+    return log_dir
+    
+
+# Defining the search space of the hyperparameters we want to optimize
+dim_learning_rate = Real(low=.0001,
+                         high=9e-3,
+                         prior='log-uniform',
+                         name='learning_rate')
+
+dim_num_dense_nodes1 = Integer(low=100,
+                               high=200,
+                               name='num_dense_nodes1')
+
+dim_num_dense_nodes2 = Integer(low=2,
+                               high=200,
+                               name='num_dense_nodes2')
+
+dim_dropout = Real(low = 0,
+                   high = .4,
+                   name = 'dropout')
+#dim_lr_decay = Real(low=1e-10, high=.9, prior='log-uniform', name='lr_decay')
+
+# dim_activation = Categorical(categories=['relu', 'sigmoid'], name='activation')
+# dim_activation2 = Categorical(categories=['relu', 'sigmoid'], name='activation2')
+
+# dim_batchnorm1 = Categorical(categories=[1,0], name='batchnorm1')
+# dim_batchnorm2 = Categorical(categories=[1,0], name='batchnorm2')
+
+# dim_dropout1 = Real(low=0, high = .6, prior='uniform', name = 'dropout1')
+# dim_dropout2 = Real(low=0, high = .6, prior='uniform', name = 'dropout2')
+# dim_l11 = Real(low=0, high = .1, prior = 'uniform', name = 'l11')
+# dim_l12 = Real(low=0, high = .1, prior = 'uniform', name = 'l12')
+# dim_l13 = Real(low=0, high = .1, prior = 'uniform', name = 'l13')
+# dim_l21 = Real(low=0, high = .1, prior = 'uniform', name = 'l21')
+# dim_l22 = Real(low=0, high = .1, prior = 'uniform', name = 'l22')
+
+dimensions = [dim_learning_rate,
+              dim_num_dense_nodes1,
+              dim_num_dense_nodes2,
+              dim_dropout]
+
+
+def create_model(learning_rate,
+                 num_dense_nodes1, 
+                 num_dense_nodes2, 
+                 dropout):
+    
+    """Function that takes the hyperparameters we want to optimize as arguments and returns a model made from them."""
+    
+    # Construct a Keras Sequential model
+    model = models.Sequential()
+    
+    # Add dense layers
+    model = models.Sequential()
+    model.add(layers.Dense(num_dense_nodes1,
+                           activation='relu',
+                           input_shape=(7,)))
+    
+    model.add(layers.Dropout(dropout))
+    
+#     if batchnorm1 == 1:
+#         model.add(layers.BatchNormalization())
+        
+    model.add(layers.Dense(num_dense_nodes2,
+                           activation='relu'))
+    
+#     if batchnorm2 == 1:
+#         model.add(layers.BatchNormalization())
+        
+    # Last dense layer with sigmoid activation since we want the output to be a probability, or a value between 0 and 1
+    model.add(layers.Dense(1,
+                           activation='sigmoid'))
+    
+    # Compiling the model
+    model.compile(optimizer=optimizers.Adam(lr=learning_rate),
+                  loss='binary_crossentropy')
+    
+    return model
+
+# Define what the current best model will be saved as
+path_best_model = '2j2bbdt_512method1_best.keras' 
+# Create a global variable that stores the current best area under the ROC curve (AUC), our metric. Initialize it to 0
+best_auc = 0.0 
+
+
+class roc_callback(Callback):
+    
+    """Creating a custom callback that prints the training and validation AUC after each epoch of training."""
+    
+    def __init__(self,training_data,validation_data):
+        self.x = training_data[0]
+        self.y = training_data[1]
+        self.x_val = validation_data[0]
+        self.y_val = validation_data[1]
+
+        
+    def on_train_begin(self, logs={}):
+        return
+
+    def on_train_end(self, logs={}):
+        return
+
+    def on_epoch_begin(self, epoch, logs={}):
+        return
+
+    def on_epoch_end(self, epoch, logs={}):
+        y_pred = self.model.predict(self.x)
+        roc = roc_auc_score(self.y, y_pred)
+        y_pred_val = self.model.predict(self.x_val)
+        roc_val = roc_auc_score(self.y_val, y_pred_val)
+        print('\rAUROC_train: %s - AUROC_val: %s' % (str(round(roc,4)),str(round(roc_val,4))),end=100*' '+'\n')
+        return
+
+    def on_batch_begin(self, batch, logs={}):
+        return
+
+    def on_batch_end(self, batch, logs={}):
+        return
+
+
+@use_named_args(dimensions=dimensions)
+def fitness(learning_rate,
+            num_dense_nodes1, 
+            num_dense_nodes2,
+            dropout):
+    """
+    This function takes the hyperparameters we want to optimize as arguments and prints the hyperparameters being used in the model that's currently being trained.
+    Then it creates a model with these hyperparameters and trains it.
+    Finally, after the model converges it calculates its AUC and saves it to a text file
+    This function is passed to the Bayesian hyperparameter optimization process, in this case gp_minimize, which uses Gaussian processes. 
+    gp_minimize will use this function to create models with different sets of hyperparameters and use the resulting AUCs to optimize our hyperparameters.
+    """
+
+    # Print the current combination of hyperparameters
+    print('Alpha: {0:.1e}'.format(learning_rate))
+    print('num_dense_nodes1:', num_dense_nodes1)
+    print('num_dense_nodes2:', num_dense_nodes2)
+    print('dropout:', dropout)
+#     print('activation:', activation)
+#     print('activation2:', activation2)
+#     print('batchnorms:', batchnorm1, batchnorm2)
+#     print('dropout1:', dropout1)
+#     print('dropout2:', dropout2)
+#     print('Layer 1 L1:', l11, 'Layer 1 L2:', l21)
+#     print('Layer 2 L1:', l12, 'Layer 2 L2:', l22)
+
+    # Create a neural network with these hyperparameters
+    model = create_model(learning_rate = learning_rate,
+                         num_dense_nodes1=num_dense_nodes1, 
+                         num_dense_nodes2=num_dense_nodes2, 
+                         dropout=dropout)
+
+    # Dir-name for the TensorBoard logs
+    log_dir = log_dir_name(learning_rate,
+                           num_dense_nodes1,
+                           num_dense_nodes2,
+                           dropout)
+
+    
+    # Callbacks used: Tensorboard callback to create and save Tensorboard log files for each model being trained,
+    # early stopping callbacks for both training and validation loss to prevent overfitting, and the custom AUC callback
+    # to be able to monitor a model's AUC during training.
+    callback_log = [TensorBoard(
+        log_dir=log_dir,
+        histogram_freq=0,
+        batch_size=512,
+        write_graph=True,
+        write_grads=False,
+        write_images=False),
+        keras.callbacks.EarlyStopping(monitor='loss',
+                                      patience=3, 
+                                      restore_best_weights=False),
+        keras.callbacks.EarlyStopping(monitor='val_loss',
+                                      patience=3,
+                                      restore_best_weights=False)
+        roc_callback(training_data=(x_train,
+                                    y_train, 
+                                    weights_train), 
+                     validation_data=(x_val,
+                                      y_val,
+                                      val_weights))]
+    
+    # Train the model. 500 epochs was used as an arbitrary high number as we don't want to risk training stopping 
+    # before the model converges due to a low number of epochs set.
+    history = model.fit(x_train,
+                        y_train, 
+                        sample_weight=train_weights, 
+                        validation_data=(x_val,
+                                         y_val, 
+                                         val_weights), 
+                        batch_size=512, 
+                        epochs=500, 
+                        callbacks=callback_log)
+    
+    # Compute score on the validation set after the last training-epoch.
+    # Need to round for this to work, otherwise the function that computes AUC 
+    # will think that values are neither increasing or decreasing
+    
+    y_val_pred = np.around(model.predict(x_val), 1)
+    auc = roc_auc_score(np.around(y_val, 1),
+                        y_val_pred, 
+                        sample_weight=val_weights)
+    # Print the AUROC score
+    print()
+    print('AUROC: ', auc)
+    print()
+
+    # Saving the tuple containing the dir-name of the model which describes its hyperparameters, the AUC it scored after it converged, 
+    # and the number of epochs it trained for. This allows us to open up to the .txt file, sort the tuples by AUC, and see how different 
+    # combinations of hyperparameters performed.
+    with open("2j2bbdt_batch512_new_method1scores.txt", "a") as f:
+        f.write("{} {} {}\n".format(log_dir, auc, len(history.history['loss'])))
+        
+        
+    # Save the model if it improves on the best found performance which is stored by the global variable best_auc
+    global best_auc
+
+    # If the AUC of the saved model is greater than the current best performance
+    if auc > best_auc:
+        # Save the new model
+        model.save(path_best_model)
+        
+        # Update the current greatest AUC score
+        best_auc = auc
+
+    # Else delete the model that just finishing training from meomory
+    del model
+    
+    # Clear the Keras session, otherwise it will keep adding new
+    # models to the same TensorFlow graph each time we create
+    # a model with a different combination of hyperparameters.
+    K.clear_session()
+    
+    # Scikit-optimize does minimization so it tries to
+    # find a set the combination of hyperparameters with the lowest fitness value.
+    # We want to maximize AUC so we negate this number.
+    return -auc
+
+
+search_result = gp_minimize(func=fitness,
+                            dimensions=dimensions,
+                            acq_func='EI', # Using the Expected Improvement acquisition function
+                            n_calls=1000)
