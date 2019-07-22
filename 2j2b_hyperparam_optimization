@@ -1,5 +1,5 @@
 """
-Written by Geoffrey Gaugler // ggaugler@cern.ch
+Written by Geoffrey Gaugler // geoffrey.gaugler@cern.ch
 
 Optimizing hyperparameters for the neural network used for the 2j2b analysis region with Bayesian optimization using Gaussian Processes via the Scikit-Optimize library. 
 This is part of a study with the ATLAS experiment at the LHC in Meyrin, Switzerland using neural networks to separate single top tW events from top anti-top ttbar events. 
